@@ -95,26 +95,44 @@ impl ImageFormatArg {
         }
     }
 
-    /// Guarda la imagen en disco según el formato especificado.
+    /// Guarda la imagen en disco de forma atómica: escribe primero en un archivo
+    /// temporal en el mismo directorio y solo lo renombra al destino final si
+    /// la codificación se completó con éxito. Así se evita dejar un archivo
+    /// corrupto/parcial si el proceso falla o es interrumpido a mitad de escritura.
     fn save(&self, image: &DynamicImage, path: &Path, quality: u8) -> Result<()> {
-        match self {
-            Self::Png => {
-                image
-                    .save_with_format(path, image::ImageFormat::Png)
-                    .with_context(|| format!("no se pudo guardar PNG en {:?}", path))?;
+        let tmp_path = tmp_path_for(path);
+
+        let write_result = (|| -> Result<()> {
+            match self {
+                Self::Png => {
+                    image
+                        .save_with_format(&tmp_path, image::ImageFormat::Png)
+                        .with_context(|| format!("no se pudo guardar PNG en {:?}", tmp_path))?;
+                }
+                Self::Jpg => {
+                    let file = File::create(&tmp_path)
+                        .with_context(|| format!("no se pudo crear {:?}", tmp_path))?;
+                    // Se usa BufWriter para optimizar las operaciones de escritura en disco
+                    let writer = BufWriter::new(file);
+                    let mut encoder =
+                        image::codecs::jpeg::JpegEncoder::new_with_quality(writer, quality);
+                    encoder
+                        .encode_image(image)
+                        .with_context(|| format!("no se pudo codificar JPEG en {:?}", tmp_path))?;
+                }
             }
-            Self::Jpg => {
-                let file =
-                    File::create(path).with_context(|| format!("no se pudo crear {:?}", path))?;
-                // Se usa BufWriter para optimizar las operaciones de escritura en disco
-                let writer = BufWriter::new(file);
-                let mut encoder =
-                    image::codecs::jpeg::JpegEncoder::new_with_quality(writer, quality);
-                encoder
-                    .encode_image(image)
-                    .with_context(|| format!("no se pudo codificar JPEG en {:?}", path))?;
-            }
+            Ok(())
+        })();
+
+        // Si algo falló durante la escritura, se limpia el temporal antes de propagar el error.
+        if let Err(err) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err);
         }
+
+        std::fs::rename(&tmp_path, path)
+            .with_context(|| format!("no se pudo renombrar {:?} a {:?}", tmp_path, path))?;
+
         Ok(())
     }
 }
@@ -233,6 +251,16 @@ fn build_filename(prefix: &str, identifier: &str, ext: &str) -> String {
     }
 }
 
+/// Genera una ruta temporal en el mismo directorio que `path`, para que el
+/// `rename` final sea atómico (mismo sistema de archivos).
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|n| format!(".{}.tmp", n.to_string_lossy()))
+        .unwrap_or_else(|| ".output.tmp".to_string());
+    path.with_file_name(file_name)
+}
+
 /// Crea y configura la barra de progreso para la consola.
 fn progress_bar(len: u64, msg: &'static str) -> ProgressBar {
     let pb = ProgressBar::new(len);
@@ -324,10 +352,19 @@ fn split_range(
     let range_suffix = format!("{}-{}", start + 1, end + 1);
     let file_name = build_filename(prefix, &range_suffix, "pdf");
     let out_path = output_dir.join(file_name);
+    let tmp_path = tmp_path_for(&out_path);
 
-    new_doc
-        .save_to_file(&out_path)
-        .with_context(|| format!("no se pudo guardar {:?}", out_path))?;
+    let save_result = new_doc
+        .save_to_file(&tmp_path)
+        .with_context(|| format!("no se pudo guardar {:?}", tmp_path));
+
+    if save_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        save_result?;
+    }
+
+    std::fs::rename(&tmp_path, &out_path)
+        .with_context(|| format!("no se pudo renombrar {:?} a {:?}", tmp_path, out_path))?;
 
     println!(
         "Generado {:?} con las páginas {}-{}",
