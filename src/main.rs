@@ -1,0 +1,339 @@
+use std::fs::File;
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand, ValueEnum};
+use image::DynamicImage;
+use indicatif::{ProgressBar, ProgressStyle};
+use pdfium_render::prelude::*;
+
+/// pdftool: extraer páginas de un PDF como imágenes, o dividirlo en varios PDFs.
+/// Usa PDFium, el motor PDF utilizado por Chromium.
+#[derive(Parser)]
+#[command(name = "pdftool", version, about, long_about = None)]
+struct Cli {
+    /// Ruta al archivo PDF de entrada
+    input: PathBuf,
+
+    /// Directorio donde buscar la librería nativa de PDFium (libpdfium.so / .dylib / .dll).
+    /// Si no se indica, se intenta buscar junto al ejecutable.
+    #[arg(long, global = true)]
+    pdfium_lib: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Extraer un rango de páginas como imágenes (PNG o JPEG)
+    Images {
+        /// Página inicial (1-indexado, inclusive)
+        #[arg(long, default_value_t = 1)]
+        from: u16,
+
+        /// Página final (1-indexado, inclusive). Por defecto, la última página.
+        #[arg(long)]
+        to: Option<u16>,
+
+        /// Formato de salida
+        #[arg(long, value_enum, default_value_t = ImageFormatArg::Png)]
+        format: ImageFormatArg,
+
+        /// Resolución de renderizado en puntos por pulgada (DPI).
+        /// 150 = borrador rápido, 300 = calidad estándar de impresión/OCR,
+        /// 600 = alta calidad (archivos más grandes y más lento).
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u32).range(1..=2400))]
+        dpi: u32,
+
+        /// Calidad JPEG (1-100). Ignorado si el formato es PNG (que no tiene pérdida).
+        #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100))]
+        quality: u8,
+
+        /// Directorio de salida
+        #[arg(long, default_value = "./output")]
+        output_dir: PathBuf,
+
+        /// Prefijo de los archivos generados. Por defecto, el nombre del PDF sin extensión.
+        #[arg(long)]
+        prefix: Option<String>,
+    },
+
+    /// Extraer un rango de páginas como un único PDF nuevo
+    Split {
+        /// Página inicial (1-indexado, inclusive)
+        #[arg(long, default_value_t = 1)]
+        from: u16,
+
+        /// Página final (1-indexado, inclusive). Por defecto, la última página.
+        #[arg(long)]
+        to: Option<u16>,
+
+        /// Directorio de salida
+        #[arg(long, default_value = "./output")]
+        output_dir: PathBuf,
+
+        /// Prefijo de los archivos generados. Por defecto, el nombre del PDF sin extensión.
+        #[arg(long)]
+        prefix: Option<String>,
+    },
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum ImageFormatArg {
+    Png,
+    Jpg,
+}
+
+impl ImageFormatArg {
+    /// Retorna la extensión de archivo correspondiente al formato.
+    fn extension(&self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpg => "jpg",
+        }
+    }
+
+    /// Guarda la imagen en disco según el formato especificado.
+    fn save(&self, image: &DynamicImage, path: &Path, quality: u8) -> Result<()> {
+        match self {
+            Self::Png => {
+                image
+                    .save_with_format(path, image::ImageFormat::Png)
+                    .with_context(|| format!("no se pudo guardar PNG en {:?}", path))?;
+            }
+            Self::Jpg => {
+                let file =
+                    File::create(path).with_context(|| format!("no se pudo crear {:?}", path))?;
+                // Se usa BufWriter para optimizar las operaciones de escritura en disco
+                let writer = BufWriter::new(file);
+                let mut encoder =
+                    image::codecs::jpeg::JpegEncoder::new_with_quality(writer, quality);
+                encoder
+                    .encode_image(image)
+                    .with_context(|| format!("no se pudo codificar JPEG en {:?}", path))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    let pdfium = init_pdfium(cli.pdfium_lib.as_deref())?;
+    let document = pdfium
+        .load_pdf_from_file(&cli.input, None)
+        .with_context(|| format!("no se pudo abrir el PDF: {:?}", cli.input))?;
+
+    let page_count = document.pages().len() as usize;
+    if page_count == 0 {
+        bail!("el PDF no tiene páginas");
+    }
+
+    let stem = cli
+        .input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("documento");
+
+    match cli.command {
+        Command::Images {
+            from,
+            to,
+            format,
+            dpi,
+            quality,
+            output_dir,
+            prefix,
+        } => {
+            let (start, end) = resolve_range(from, to, page_count)?;
+            let prefix = prefix.as_deref().unwrap_or(stem);
+            extract_images(
+                &document,
+                start,
+                end,
+                format,
+                dpi,
+                quality,
+                &output_dir,
+                prefix,
+            )?;
+        }
+        Command::Split {
+            from,
+            to,
+            output_dir,
+            prefix,
+        } => {
+            let (start, end) = resolve_range(from, to, page_count)?;
+            let prefix = prefix.as_deref().unwrap_or(stem);
+            split_range(&pdfium, &document, start, end, &output_dir, prefix)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Intenta enlazar con PDFium:
+/// primero en el directorio indicado (si se especificó expresamente),
+/// y por último junto al ejecutable actual.
+fn init_pdfium(explicit_dir: Option<&Path>) -> Result<Pdfium> {
+    if let Some(dir) = explicit_dir {
+        let name = Pdfium::pdfium_platform_library_name_at_path(dir);
+        let bindings = Pdfium::bind_to_library(name)
+            .with_context(|| format!("no se pudo cargar PDFium desde {:?}", dir))?;
+        return Ok(Pdfium::new(bindings));
+    }
+
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let name = Pdfium::pdfium_platform_library_name_at_path(&exe_dir);
+
+    let bindings = Pdfium::bind_to_library(name).with_context(|| {
+        format!(
+            "no se encontró la librería nativa de PDFium junto al ejecutable en {:?}. \
+             Descárgala desde https://github.com/bblanchon/pdfium-binaries \
+             y colócala junto al ejecutable, o pásala con --pdfium-lib <directorio>.",
+            exe_dir
+        )
+    })?;
+
+    Ok(Pdfium::new(bindings))
+}
+
+/// Convierte el rango 1-indexado e inclusivo dado por el usuario
+/// al rango 0-indexado que espera pdfium-render, validando sus límites.
+fn resolve_range(from: u16, to: Option<u16>, page_count: usize) -> Result<(usize, usize)> {
+    let from = from as usize;
+    let to = to.map(|v| v as usize).unwrap_or(page_count);
+
+    if from == 0 || to == 0 {
+        bail!("las páginas se numeran desde 1, no desde 0");
+    }
+    if from > to {
+        bail!("--from ({from}) no puede ser mayor que --to ({to})");
+    }
+    if to > page_count {
+        bail!("el PDF solo tiene {page_count} páginas, pero --to = {to}");
+    }
+    Ok((from - 1, to - 1)) // Rango 0-indexado, inclusive
+}
+
+/// Formatea el nombre del archivo de salida omitiendo el separador si el prefijo está vacío.
+fn build_filename(prefix: &str, identifier: &str, ext: &str) -> String {
+    if prefix.is_empty() {
+        format!("{identifier}.{ext}")
+    } else {
+        format!("{prefix} - {identifier}.{ext}")
+    }
+}
+
+/// Crea y configura la barra de progreso para la consola.
+fn progress_bar(len: u64, msg: &'static str) -> ProgressBar {
+    let pb = ProgressBar::new(len);
+    pb.set_style(
+        ProgressStyle::with_template("{msg} [{bar:40}] {pos}/{len}")
+            .unwrap()
+            .progress_chars("=> "),
+    );
+    pb.set_message(msg);
+    pb
+}
+
+/// Extraer un rango de páginas como imágenes (PNG o JPEG)
+fn extract_images(
+    document: &PdfDocument,
+    start: usize,
+    end: usize,
+    format: ImageFormatArg,
+    dpi: u32,
+    quality: u8,
+    output_dir: &Path,
+    prefix: &str,
+) -> Result<()> {
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("no se pudo crear el directorio {:?}", output_dir))?;
+
+    let total = (end - start + 1) as u64;
+    let pb = progress_bar(total, "Renderizando páginas");
+
+    for index in start..=end {
+        let page = document.pages().get(index as i32)?;
+
+        // El tamaño de página en PDFium se especifica en puntos tipográficos (1/72 de pulgada).
+        // Calculamos los píxeles según el DPI solicitado.
+        let width_px = (page.width().value * dpi as f32 / 72.0).round() as i32;
+        let height_px = (page.height().value * dpi as f32 / 72.0).round() as i32;
+
+        let render_config = PdfRenderConfig::new()
+            .set_target_size(width_px, height_px)
+            .render_form_data(true);
+
+        let bitmap = page
+            .render_with_config(&render_config)
+            .with_context(|| format!("fallo al renderizar la página {}", index + 1))?;
+
+        let image = bitmap
+            .as_image()
+            .with_context(|| format!("fallo al convertir a imagen la página {}", index + 1))?;
+
+        let page_suffix = format!("{:04}", index + 1);
+        let file_name = build_filename(prefix, &page_suffix, format.extension());
+        let out_path = output_dir.join(file_name);
+
+        format.save(&image, &out_path, quality)?;
+
+        pb.inc(1);
+    }
+
+    pb.finish_with_message("Listo");
+    println!(
+        "Extraídas {} páginas ({}-{}) a {:?}",
+        total,
+        start + 1,
+        end + 1,
+        output_dir
+    );
+    Ok(())
+}
+
+/// Extrae un rango de páginas a un nuevo PDF copiando los objetos
+/// directamente de la estructura del PDF.
+fn split_range(
+    pdfium: &Pdfium,
+    document: &PdfDocument,
+    start: usize,
+    end: usize,
+    output_dir: &Path,
+    prefix: &str,
+) -> Result<()> {
+    std::fs::create_dir_all(output_dir)?;
+
+    let mut new_doc = pdfium.create_new_pdf()?;
+    let range = (start as i32)..=(end as i32);
+    new_doc
+        .pages_mut()
+        .copy_page_range_from_document(document, range, 0)
+        .context("no se pudo copiar el rango de páginas")?;
+
+    let range_suffix = format!("{}-{}", start + 1, end + 1);
+    let file_name = build_filename(prefix, &range_suffix, "pdf");
+    let out_path = output_dir.join(file_name);
+
+    new_doc
+        .save_to_file(&out_path)
+        .with_context(|| format!("no se pudo guardar {:?}", out_path))?;
+
+    println!(
+        "Generado {:?} con las páginas {}-{}",
+        out_path,
+        start + 1,
+        end + 1
+    );
+    Ok(())
+}
