@@ -330,7 +330,7 @@ fn extract_images(
             .as_image()
             .with_context(|| format!("fallo al convertir a imagen la página {}", index + 1))?;
 
-        let page_suffix = format!("{:04}", index + 1);
+        let page_suffix = format!("{:03}", index + 1);
         let file_name = build_filename(prefix, &page_suffix, format.extension());
         let out_path = output_dir.join(file_name);
 
