@@ -16,11 +16,6 @@ struct Cli {
     /// Ruta al archivo PDF de entrada
     input: PathBuf,
 
-    /// Directorio donde buscar la librería nativa de `PDFium` (libpdfium.so / .dylib / .dll).
-    /// Si no se indica, se intenta buscar junto al ejecutable.
-    #[arg(long, global = true)]
-    pdfium_lib: Option<PathBuf>,
-
     #[command(subcommand)]
     command: Command,
 }
@@ -145,7 +140,7 @@ impl ImageFormatArg {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let pdfium = init_pdfium(cli.pdfium_lib.as_deref())?;
+    let pdfium = init_pdfium()?;
 
     let document = pdfium
         .load_pdf_from_file(&cli.input, None)
@@ -200,31 +195,34 @@ fn main() -> Result<()> {
 }
 
 /// Intenta enlazar con `PDFium`:
-/// primero en el directorio indicado (si se especificó expresamente),
-/// y por último junto al ejecutable actual.
-fn init_pdfium(explicit_dir: Option<&Path>) -> Result<Pdfium> {
-    if let Some(dir) = explicit_dir {
-        let name = Pdfium::pdfium_platform_library_name_at_path(dir);
-        let bindings = Pdfium::bind_to_library(name)
-            .with_context(|| format!("no se pudo cargar PDFium desde {}", dir.display()))?;
-        return Ok(Pdfium::new(bindings));
-    }
-
+/// primero busca en el directorio donde está instalado el ejecutable,
+/// después en el directorio donde fue llamado el ejecutable
+/// por último, busca si está instalado en el sistema operativo.
+fn init_pdfium() -> Result<Pdfium> {
+    // obtiene la ruta donde se almacena el binario
+    // solo ruta, no incluye nombre del archivo ("pdfium")
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."));
+        .context("no se pudo obtener la ruta padre del ejecutable.")?;
 
-    let name = Pdfium::pdfium_platform_library_name_at_path(&exe_dir);
+    // agrega el nombre de la libreria para formar la ruta completa ("pdfium")
+    let file_path = Pdfium::pdfium_platform_library_name_at_path(&exe_dir);
+    let file_path_current_working_directory = Pdfium::pdfium_platform_library_name_at_path("./");
 
-    let bindings = Pdfium::bind_to_library(name).with_context(|| {
-        format!(
-            "no se encontró la librería nativa de PDFium junto al ejecutable en {}. \
-             Descárgala desde https://github.com/bblanchon/pdfium-binaries \
-             y colócala junto al ejecutable, o pásala con --pdfium-lib <directorio>.",
-            exe_dir.display()
-        )
-    })?;
+    let bindings = Pdfium::bind_to_library(file_path)
+        .or_else(|_| Pdfium::bind_to_library(file_path_current_working_directory))
+        .or_else(|_| Pdfium::bind_to_system_library())
+        .with_context(|| {
+            format!(
+                "no se encontró la librería nativa de PDFium junto al ejecutable ({}) \
+                ni donde fue llamada la herramienta ni en el sistema operativo. \
+                Descárgala desde https://github.com/bblanchon/pdfium-binaries \
+                y colócala junto al ejecutable o en tu directorio de trabajo. \
+                instala PDFium en tu sistema operativo.",
+                exe_dir.display()
+            )
+        })?;
 
     Ok(Pdfium::new(bindings))
 }
