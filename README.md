@@ -1,17 +1,19 @@
 # PDF Tool
 
-- Herramienta simple para extraer páginas de un PDF como imágenes, o dividirlo en varios PDFs.
-- Usa PDFium (el motor PDF utilizado por Chromium) vía el crate `pdfium-render`.
+- Herramienta simple para extraer un rango de páginas en un nuevo PDF o,
+- para exportarlas como imágenes.
+- Usa PDFium (el motor PDF utilizado por Chromium).
 
 ## Requisitos
 
 1. Rust, para compilar.
-2. Una biblioteca dinámica de PDFium (`libpdfium.so` en Linux).
+2. Biblioteca dinámica de PDFium (`.so`, `.dll`).
 
 PDFium debe estar disponible mediante una de estas opciones:
 
 - En el mismo directorio que el ejecutable.
-- Indicando su directorio con `--pdfium-lib <directorio>`.
+- En la ruta actual de trabajo.
+- Instalado en el Sistema Operativo.
 
 ## Instalación
 
@@ -44,6 +46,16 @@ Linux. Para el usuario
 install -Dm755 target/release/pdftool ~/.local/bin/pdftool
 ```
 
+## Ejemplos de uso
+
+```bash
+# Extrae un rango de páginas en un nuevo PDF
+pdftool document.pdf split --from 10 --to 20                    #./output/document - 10-20.pdf
+
+# Extrae un rango de páginas en formato WebP
+pdftool document.pdf images --from 5 --format webp --prefix ""  #./output/005.webp, 006.webp, ...
+```
+
 ## Desintalar
 
 1. Binario
@@ -51,4 +63,4 @@ install -Dm755 target/release/pdftool ~/.local/bin/pdftool
 - Cargo `cargo uninstall pdftool`
 - Instalado para el usuario en Linux `rm ~/.local/bin/pdftool`
 
-2. Eliminar la biblioteca dinámica, por ejemplo `libpdfium.so`.
+2. Opcionalmente, eliminar la biblioteca dinámica, por ejemplo `libpdfium.so`.

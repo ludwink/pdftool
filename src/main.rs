@@ -1,5 +1,3 @@
-use std::fs::File;
-use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -7,8 +5,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use image::DynamicImage;
 use indicatif::{ProgressBar, ProgressStyle};
 use pdfium_render::prelude::*;
+use webpx::{Encoder, Unstoppable};
 
-/// pdftool: extraer páginas de un PDF como imágenes, o dividirlo en varios PDFs.
+/// # pdftool
+/// Herramienta simple para extraer un rango de páginas en un nuevo PDF o,
+/// para exportarlas como imágenes.
 /// Usa `PDFium`, el motor PDF utilizado por Chromium.
 #[derive(Parser)]
 #[command(name = "pdftool", version, about, long_about = None)]
@@ -22,7 +23,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Extraer un rango de páginas como imágenes (PNG o JPEG)
+    /// Extraer un rango de páginas como imágenes (PNG o WebP)
     Images {
         /// Página inicial (1-indexado, inclusive)
         #[arg(long, default_value_t = 1)]
@@ -42,8 +43,8 @@ enum Command {
         #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u32).range(1..=2400))]
         dpi: u32,
 
-        /// Calidad JPEG (1-100). Ignorado si el formato es PNG (que no tiene pérdida).
-        #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100))]
+        /// Calidad WebP (1-100). Ignorado si el formato es PNG (que no tiene pérdida).
+        #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
         quality: u8,
 
         /// Directorio de salida
@@ -78,7 +79,7 @@ enum Command {
 #[derive(Copy, Clone, ValueEnum)]
 enum ImageFormatArg {
     Png,
-    Jpg,
+    Webp,
 }
 
 impl ImageFormatArg {
@@ -86,7 +87,7 @@ impl ImageFormatArg {
     fn extension(self) -> &'static str {
         match self {
             Self::Png => "png",
-            Self::Jpg => "jpg",
+            Self::Webp => "webp",
         }
     }
 
@@ -106,16 +107,21 @@ impl ImageFormatArg {
                             format!("no se pudo guardar PNG en {}", tmp_path.display())
                         })?;
                 }
-                Self::Jpg => {
-                    let file = File::create(&tmp_path)
-                        .with_context(|| format!("no se pudo crear {}", tmp_path.display()))?;
-                    // Se usa BufWriter para optimizar las operaciones de escritura en disco
-                    let writer = BufWriter::new(file);
-                    let mut encoder =
-                        image::codecs::jpeg::JpegEncoder::new_with_quality(writer, quality);
-                    encoder.encode_image(image).with_context(|| {
-                        format!("no se pudo codificar JPEG en {}", tmp_path.display())
-                    })?;
+
+                Self::Webp => {
+                    // No convierte ni copia los píxeles: toma una referencia
+                    // al RgbaImage contenido dentro del DynamicImage.
+                    let rgba = image
+                        .as_rgba8()
+                        .context("PDFium no devolvió una imagen RGBA8")?;
+
+                    let encoded = Encoder::new_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+                        .quality(f32::from(quality))
+                        .encode(Unstoppable)
+                        .map_err(|err| anyhow::anyhow!("no se pudo codificar WebP: {err}"))?;
+
+                    std::fs::write(&tmp_path, encoded)
+                        .with_context(|| format!("no se pudo escribir {}", tmp_path.display()))?;
                 }
             }
             Ok(())
@@ -286,7 +292,7 @@ struct ImageExtractOptions {
     prefix: String,
 }
 
-/// Extraer un rango de páginas como imágenes (PNG o JPEG)
+/// Extraer un rango de páginas como imágenes (PNG o WebP)
 fn extract_images(
     document: &PdfDocument,
     start: usize,
