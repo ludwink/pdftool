@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use image::DynamicImage;
 use indicatif::{ProgressBar, ProgressStyle};
 use jpegxl_rs::{
-    encode::{ColorEncoding, EncoderFrame, EncoderResult},
+    encode::{ColorEncoding, EncoderFrame, EncoderResult, EncoderSpeed},
     encoder_builder,
 };
 use pdfium_render::prelude::*;
@@ -122,7 +122,7 @@ impl ImageFormatArg {
                         .uses_original_profile(true)
                         .color_encoding(ColorEncoding::Srgb)
                         .lossless(true)
-                        .quality(0.0)
+                        .speed(EncoderSpeed::Glacier)
                         .build()
                         .context("no se pudo inicializar el codificador JPEG XL")?;
 
