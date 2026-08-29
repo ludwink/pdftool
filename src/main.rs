@@ -311,14 +311,9 @@ fn extract_images(
         let page_index = i32::try_from(index).context("índice de página fuera de rango")?;
         let page = document.pages().get(page_index)?;
         // El tamaño de página en PDFium se especifica en puntos tipográficos (1/72 de pulgada).
-        // Calculamos los píxeles según el DPI solicitado.
-        let dpi_f32 = *dpi as f32;
-        let width_px = (page.width().value * dpi_f32 / 72.0).round() as i32;
-        let height_px = (page.height().value * dpi_f32 / 72.0).round() as i32;
+        let scale = (*dpi as f32) / 72.0;
 
-        let render_config = PdfRenderConfig::new()
-            .set_target_size(width_px, height_px)
-            .render_form_data(true);
+        let render_config = PdfRenderConfig::new().scale_page_by_factor(scale);
 
         let bitmap = page
             .render_with_config(&render_config)
