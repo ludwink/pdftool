@@ -4,6 +4,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use image::DynamicImage;
 use indicatif::{ProgressBar, ProgressStyle};
+use jpegxl_rs::{
+    encode::{ColorEncoding, EncoderFrame, EncoderResult},
+    encoder_builder,
+};
 use pdfium_render::prelude::*;
 use webpx::{Encoder, Unstoppable};
 
@@ -23,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Extraer un rango de páginas como imágenes (PNG o WebP)
+    /// Extraer un rango de páginas como imágenes (JPEG XL o WebP)
     Images {
         /// Página inicial (1-indexado, inclusive)
         #[arg(long, default_value_t = 1)]
@@ -34,7 +38,7 @@ enum Command {
         to: Option<u16>,
 
         /// Formato de salida
-        #[arg(long, value_enum, default_value_t = ImageFormatArg::Png)]
+        #[arg(long, value_enum, default_value_t = ImageFormatArg::Jxl)]
         format: ImageFormatArg,
 
         /// Resolución de renderizado en puntos por pulgada (DPI).
@@ -43,7 +47,7 @@ enum Command {
         #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u32).range(1..=2400))]
         dpi: u32,
 
-        /// Calidad WebP (1-100). Ignorado si el formato es PNG (que no tiene pérdida).
+        /// Calidad WebP (1-100). Ignorado si el formato es JXL (que no tiene pérdida).
         #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
         quality: u8,
 
@@ -78,7 +82,7 @@ enum Command {
 
 #[derive(Copy, Clone, ValueEnum)]
 enum ImageFormatArg {
-    Png,
+    Jxl,
     Webp,
 }
 
@@ -86,7 +90,7 @@ impl ImageFormatArg {
     /// Retorna la extensión de archivo correspondiente al formato.
     fn extension(self) -> &'static str {
         match self {
-            Self::Png => "png",
+            Self::Jxl => "jxl",
             Self::Webp => "webp",
         }
     }
@@ -99,22 +103,40 @@ impl ImageFormatArg {
         let tmp_path = tmp_path_for(path);
 
         let write_result = (|| -> Result<()> {
+            // `bitmap.as_image()` produce un DynamicImage::ImageRgba8. Se toma
+            // prestado su búfer sin convertir ni copiar los píxeles.
+            let rgba = image
+                .as_rgba8()
+                .context("PDFium no devolvió una imagen RGBA8")?;
+
             match self {
-                Self::Png => {
-                    image
-                        .save_with_format(&tmp_path, image::ImageFormat::Png)
-                        .with_context(|| {
-                            format!("no se pudo guardar PNG en {}", tmp_path.display())
-                        })?;
+                Self::Jxl => {
+                    // `encode()` usa tres canales por defecto. Para conservar el
+                    // alfa hay que describir explícitamente un frame RGBA.
+                    let frame = EncoderFrame::new(rgba.as_raw().as_slice()).num_channels(4);
+                    let mut encoder = encoder_builder()
+                        .has_alpha(true)
+                        // La codificación matemáticamente lossless no puede usar
+                        // la transformación interna a XYB: debe conservar el
+                        // perfil/color de los píxeles de entrada.
+                        .uses_original_profile(true)
+                        .color_encoding(ColorEncoding::Srgb)
+                        .lossless(true)
+                        .quality(0.0)
+                        .build()
+                        .context("no se pudo inicializar el codificador JPEG XL")?;
+
+                    // El render de PDFium ya contiene muestras de 8 bits; pasarlas
+                    // a RGBA16 no agregaría información y duplicaría la memoria.
+                    let encoded: EncoderResult<u8> = encoder
+                        .encode_frame(&frame, rgba.width(), rgba.height())
+                        .context("no se pudo codificar JPEG XL")?;
+
+                    std::fs::write(&tmp_path, encoded.data)
+                        .with_context(|| format!("no se pudo escribir {}", tmp_path.display()))?;
                 }
 
                 Self::Webp => {
-                    // No convierte ni copia los píxeles: toma una referencia
-                    // al RgbaImage contenido dentro del DynamicImage.
-                    let rgba = image
-                        .as_rgba8()
-                        .context("PDFium no devolvió una imagen RGBA8")?;
-
                     let encoded = Encoder::new_rgba(rgba.as_raw(), rgba.width(), rgba.height())
                         .quality(f32::from(quality))
                         .encode(Unstoppable)
@@ -292,7 +314,7 @@ struct ImageExtractOptions {
     prefix: String,
 }
 
-/// Extraer un rango de páginas como imágenes (PNG o WebP)
+/// Extraer un rango de páginas como imágenes (JPEG XL o WebP)
 fn extract_images(
     document: &PdfDocument,
     start: usize,

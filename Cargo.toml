@@ -6,8 +6,9 @@ edition = "2024"
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
 pdfium-render = "0.9.3"
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { version = "0.25.10", default-features = false }
 webpx = "0.4.0"
+jpegxl-rs = { version = "0.15.0", features = ["vendored"] }
 anyhow = "1.0.104"
 indicatif = "0.18.6"
 
